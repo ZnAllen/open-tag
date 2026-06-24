@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import i18n from "../i18n";
 import { useStore, fmtTime, type Msg, type Att } from "../store.tsx";
 import { MessageContent } from "../messageRender.tsx";
-import { Smile, X, ExternalLink, CheckCircle2, MessageCircle, MoreHorizontal, ImagePlus, Paperclip, Send, Link2, Clipboard, Bookmark, CheckSquare, Circle, Play, Eye, Ban, ArrowDown, BellOff, Moon, Power } from "lucide-react";
+import { Smile, X, ExternalLink, CheckCircle2, MessageCircle, MoreHorizontal, ImagePlus, Paperclip, Send, Link2, Clipboard, Bookmark, CheckSquare, Circle, Play, Eye, Ban, ArrowDown, BellOff, Moon, Power, Lock, Globe, Archive, Trash2 } from "lucide-react";
 // Task badge per message row: icon changes with task status; color tokens from DESIGN.md (see .task-pill.st-* styles)
 const TASK_ICON: Record<string, typeof Circle> = { todo: Circle, in_progress: Play, in_review: Eye, done: CheckCircle2, closed: Ban };
 import { IconWrench, IconFile, IconExternalLink, IconDownload } from "../icons.tsx";
@@ -116,7 +116,7 @@ export function Chat() {
   const { t } = useTranslation();
   const { api, channels, dms, unread, agents, humans, machines, slug, me, myRole, capabilities, reload, onEvent, openDM, markRead, uploadFiles, uploadOne, attachmentUrl, react, openThread, savedIds, saveMsg, unsaveMsg } = useStore();
   const confirm = useConfirm();
-  const [chMenu, setChMenu] = useState(false);
+  const [showEdit, setShowEdit] = useState(false);
   const manageServer = myRole === "owner" || myRole === "admin"; // server admins get the full task-status dropdown (matches TaskBoard permission model)
   const { channelId } = useParams();
   const nav = useNavigate();
@@ -260,17 +260,7 @@ export function Chat() {
           {!isDm && cur && <div className="chtabs">{["chat", "tasks", "files"].map((tt) => <button key={tt} className={chatTab === tt ? "on" : ""} onClick={() => setTab(tt)}>{tt === "chat" ? t("nav.channel") : tt === "tasks" ? t("nav.tasks") : t("common.files")}</button>)}</div>}
           {!isDm && cur && <button className="joinbtn" style={{ marginLeft: "auto" }} title={t("chat.channelMembers")} onClick={() => setShowMembers(true)}>{t("chat.members")}</button>}
           {!isDm && cur && capabilities.manageChannels && (
-            <div className="ch-menu-wrap">
-              <button className="joinbtn" title={t("chat.channelSettings")} onClick={() => setChMenu((v) => !v)}>⋯</button>
-              {chMenu && (<>
-                <div className="ch-menu-backdrop" onClick={() => setChMenu(false)} />
-                <div className="ch-menu">
-                  <button onClick={async () => { const nn = prompt(t("chat.newChannelName"), cur.name); setChMenu(false); if (nn && nn.trim()) { await api("PATCH", `/api/channels/${cur.id}`, { name: nn.trim() }); await reload(); } }}>{t("chat.rename")}</button>
-                  <button onClick={async () => { setChMenu(false); await api("POST", `/api/channels/${cur.id}/archive`); await reload(); nav(`/s/${slug}/channel`); }}>{t("chat.archive")}</button>
-                  <button className="danger" onClick={async () => { setChMenu(false); if (!(await confirm({ title: t("chat.deleteChannelTitle", { name: cur.name }), message: t("chat.deleteChannelMsg"), confirmLabel: t("chat.delete"), danger: true }))) return; await api("DELETE", `/api/channels/${cur.id}`); await reload(); nav(`/s/${slug}/channel`); }}>{t("chat.delete")}</button>
-                </div>
-              </>)}
-            </div>
+            <button className="joinbtn" title={t("chat.channelSettings")} onClick={() => setShowEdit(true)}>⋯</button>
           )}
         </div>
         {machines.length === 0 && capabilities.manageMachines && (
@@ -416,6 +406,7 @@ export function Chat() {
             </>}
       </aside>}
       {showMembers && cur && <ChannelMembersModal channelId={cur.id} channelName={cur.name} onClose={() => setShowMembers(false)} />}
+      {showEdit && cur && <EditChannelModal channel={cur} onClose={() => setShowEdit(false)} onDone={async () => { setShowEdit(false); await reload(); }} onDeleted={() => { setShowEdit(false); reload(); nav(`/s/${slug}/channel`); }} />}
       {ctxMenu && (() => {
         const m = ctxMenu.m;
         const close = () => setCtxMenu(null);
@@ -450,6 +441,67 @@ export function Chat() {
         );
       })()}
     </>
+  );
+}
+
+// Edit-channel modal: name + description + visibility toggle + archive + delete. Replaces the old prompt()-based rename dropdown.
+function EditChannelModal({ channel, onClose, onDone, onDeleted }: { channel: any; onClose: () => void; onDone: () => void; onDeleted: () => void }) {
+  const { t } = useTranslation();
+  useEscClose(onClose);
+  const { api } = useStore();
+  const confirm = useConfirm();
+  const [name, setName] = useState(channel.name as string);
+  const [desc, setDesc] = useState((channel.description ?? "") as string);
+  const [saving, setSaving] = useState(false);
+  const isPrivate = channel.type === "private";
+
+  const save = async () => {
+    if (!name.trim()) return;
+    setSaving(true);
+    try { await api("PATCH", `/api/channels/${channel.id}`, { name: name.trim(), description: desc.trim() }); onDone(); }
+    finally { setSaving(false); }
+  };
+  const toggleVisibility = async () => {
+    await api("PATCH", `/api/channels/${channel.id}`, { visibility: isPrivate ? "public" : "private" });
+    onDone();
+  };
+  const doArchive = async () => {
+    await api("POST", `/api/channels/${channel.id}/archive`);
+    onDeleted();
+  };
+  const doDelete = async () => {
+    if (!(await confirm({ title: t("chat.deleteChannelTitle", { name: channel.name }), message: t("chat.deleteChannelMsg"), confirmLabel: t("chat.delete"), danger: true }))) return;
+    await api("DELETE", `/api/channels/${channel.id}`);
+    onDeleted();
+  };
+
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>{t("chat.editChannel")}</h3>
+        <label>{t("sidebar.fieldName")}</label>
+        <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder={t("sidebar.namePlaceholder")} onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing && name.trim()) save(); }} />
+        <label>{t("sidebar.descLabel")}</label>
+        <textarea value={desc} onChange={(e) => setDesc(e.target.value)} placeholder={t("sidebar.descPlaceholder")} />
+        <div className="acts">
+          <button className="cancel" onClick={onClose}>{t("sidebar.cancelBtn")}</button>
+          <button className="ok" onClick={save} disabled={!name.trim() || saving}>{t("chat.saveChanges")}</button>
+        </div>
+        <hr className="ch-sep" />
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <button className="ch-act" onClick={toggleVisibility}>
+            {isPrivate ? <Globe size={14} /> : <Lock size={14} />}
+            {isPrivate ? t("chat.makePublic") : t("chat.makePrivate")}
+          </button>
+          <button className="ch-act ch-act-danger" onClick={doArchive}>
+            <Archive size={14} /> {t("chat.archive")}
+          </button>
+          <button className="ch-act ch-act-danger" onClick={doDelete}>
+            <Trash2 size={14} /> {t("chat.delete")}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
