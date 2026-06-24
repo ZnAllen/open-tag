@@ -22,7 +22,9 @@
     "stop:prod": "lsof -ti tcp:7788 | xargs kill 2>/dev/null; true",
     "daemon": "tsx src/daemon/index.ts --api-key poc-secret-key",
     "cli": "tsx src/cli/index.ts",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p web/tsconfig.json"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p web/tsconfig.json",
+    "wt:add": "bash scripts/wt-add.sh",
+    "wt:rm": "bash scripts/wt-rm.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
