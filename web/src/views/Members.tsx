@@ -407,9 +407,11 @@ export function CreateAgentModal({ onClose, prefill, onCreated }: { onClose: () 
   const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
   useEffect(() => { (async () => { try { const d = await api("GET", `/api/servers/${serverId}/machines/${machineId || "none"}/runtime-models/${runtime}`); const ms = d.models || []; setModels(ms); setModel(ms[0]?.id || ""); } catch { setModels([]); } })(); }, [runtime, machineId]);
   const create = async () => {
-    if (!name.trim()) { setErr(t("members.nameRequired")); return; }
+    const nm = name.trim();
+    if (!nm) { setErr(t("members.nameRequired")); return; }
+    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(nm) || nm.length > 64) { setErr(t("members.nameInvalid")); return; } // @mention handle must be machine-safe; keep regex + length 64 in sync with core.ts AGENT_NAME_RE / MAX_AGENT_NAME
     setBusy(true); setErr("");
-    try { const r = await api("POST", "/api/agents", { machineId: machineId || null, name: name.trim(), description: desc.trim() || null, runtime, model: model || null, reasoning: runtime === "codex" ? (reasoning || null) : null, fastMode: fast }); await reload(); if (r?.id) onCreated?.({ id: r.id, name: r.name ?? name.trim() }); onClose(); }
+    try { const r = await api("POST", "/api/agents", { machineId: machineId || null, name: nm, description: desc.trim() || null, runtime, model: model || null, reasoning: runtime === "codex" ? (reasoning || null) : null, fastMode: fast }); await reload(); if (r?.id) onCreated?.({ id: r.id, name: r.name ?? nm }); onClose(); }
     catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
   };
   const RUNTIMES = [{ value: "claude", label: "Claude Code" }, { value: "codex", label: "Codex" }, { value: "gemini", label: "Gemini" }, { value: "opencode", label: "OpenCode" }];
@@ -421,7 +423,7 @@ export function CreateAgentModal({ onClose, prefill, onCreated }: { onClose: () 
         <h3>{t("members.createAgentTitle")}</h3>
         <label>{t("members.computerLabel")}</label>
         <Select ariaLabel={t("members.computerAriaLabel")} value={machineId} options={machineOpts} onChange={setMachineId} placeholder={t("members.noMachineOnline")} />
-        <label>{t("members.nameLabel")}</label><input value={name} onChange={(e) => setName(e.target.value)} placeholder={t("members.namePlaceholder")} />
+        <label>{t("members.nameLabel")}</label><input value={name} maxLength={64} onChange={(e) => setName(e.target.value)} placeholder={t("members.namePlaceholder")} />
         <label>{t("members.descriptionLabel")}</label><textarea value={desc} maxLength={3000} onChange={(e) => setDesc(e.target.value)} placeholder={t("members.descriptionPlaceholder")} />
         <label>Runtime</label>
         <Select ariaLabel="Runtime" value={runtime} options={RUNTIMES} onChange={setRuntime} />

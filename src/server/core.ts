@@ -19,6 +19,21 @@ export const MAX_DESCRIPTION = 3000;
 export const DESC_TOO_LONG = `Description must be at most ${MAX_DESCRIPTION} characters`;
 export const descTooLong = (s: unknown): boolean => typeof s === "string" && s.length > MAX_DESCRIPTION;
 
+// Agent name is the @mention handle: used directly as @<name> (parseMentions re, CLI, web) and as the
+// dm:@<name> lookup key (resolveTarget). It must be a machine-safe identifier — spaces / punctuation /
+// emoji / leading digits break mention parsing and DM target resolution. Display-friendly text (Chinese,
+// spaces, emoji) belongs in displayName, which is unconstrained and drives all human-facing rendering.
+// `agents.name` is an unbounded `text` column, so the length cap is enforced here, not by the DB.
+// Trailing / repeated hyphens (`bot--ok`, `my-agent-`) are intentionally allowed: they are harmless for
+// @mention / DM resolution since the mention charset itself includes `-`; GitHub-style "no trailing
+// hyphen" tightening is deferred as cosmetic. ⚠️ Keep AGENT_NAME_RE + MAX_AGENT_NAME in sync with the
+// inline mirror in web/src/views/Members.tsx (CreateAgentModal) — there is no shared module because the
+// web bundle must not import server code (it would pull in db/drizzle).
+export const MAX_AGENT_NAME = 64;
+export const AGENT_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+export const INVALID_AGENT_NAME = `Agent name must be 1-${MAX_AGENT_NAME} characters, start with a letter, and contain only letters, numbers, hyphens, and underscores`;
+export const invalidAgentName = (s: unknown): boolean => typeof s !== "string" || s.length > MAX_AGENT_NAME || !AGENT_NAME_RE.test(s);
+
 /** Create a workspace (server/community): create server + creator as owner + default #all channel + add owner to channel. Shared by dev-login / POST /api/servers / seed. */
 export async function createServer(name: string, slug: string, ownerId: string) {
   const [srv] = await db.insert(schema.servers).values({ name, slug, ownerId, plan: "free" }).returning();
