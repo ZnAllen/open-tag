@@ -1,0 +1,10 @@
+node_modules/
+dist/
+web/dist/
+.env*
+!.env.example
+*.log
+logs/
+.DS_Store
+drizzle/
+.claude/settings.local.json

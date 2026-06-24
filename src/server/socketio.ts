@@ -1,0 +1,72 @@
+// Human-facing realtime over socket.io.
+// Auth: the client handshake auth carries { token, serverId }; the server verifies the JWT +
+// checks server membership → joins room server:<serverId> → emits "rooms:joined".
+// Events: the server fans out named events like 42["message:new",payload] (see emitMapped).
+import { Server as IOServer, type Socket } from "socket.io";
+import type { Server } from "node:http";
+import { and, eq } from "drizzle-orm";
+import { db, schema } from "../db/index.js";
+import { verifyUser } from "./auth.js";
+import { createLogger } from "../log.js";
+
+const log = createLogger("server:io");
+let io: IOServer | null = null;
+
+export function attachSocketIO(server: Server): void {
+  io = new IOServer(server, { cors: { origin: "*" }, path: "/socket.io/" });
+  io.on("connection", async (socket: Socket) => {
+    const auth = (socket.handshake.auth || {}) as { token?: string; serverId?: string };
+    const uid = verifyUser(auth.token ?? null);
+    const serverId = auth.serverId;
+    if (!uid || !serverId) { socket.disconnect(true); return; }
+    const mem = (await db.select().from(schema.serverMembers)
+      .where(and(eq(schema.serverMembers.serverId, serverId), eq(schema.serverMembers.userId, uid))))[0];
+    if (!mem) { socket.disconnect(true); return; }
+    socket.data.uid = uid; socket.data.serverId = serverId;
+    socket.join(`server:${serverId}`);
+    // Channel isolation: join the channel:<id> room for every channel this user belongs to → content-bearing events only reach members, so private channels are not leaked to non-members
+    const myChans = await db.select({ channelId: schema.channelMembers.channelId }).from(schema.channelMembers)
+      .where(and(eq(schema.channelMembers.memberType, "user"), eq(schema.channelMembers.memberId, uid)));
+    for (const c of myChans) socket.join(`channel:${c.channelId}`);
+    socket.emit("rooms:joined");
+    log.debug("socket connected", { uid, serverId, channels: myChans.length });
+    // Mid-session join / new channel: client emits join:channel → server checks membership then joins the room (leave:channel likewise).
+    socket.on("join:channel", async (channelId: string) => {
+      if (!channelId || typeof channelId !== "string") return;
+      const m = (await db.select().from(schema.channelMembers).where(and(eq(schema.channelMembers.channelId, channelId), eq(schema.channelMembers.memberType, "user"), eq(schema.channelMembers.memberId, uid))))[0];
+      if (m) socket.join(`channel:${channelId}`); // members only (prevents eavesdropping on private channels)
+    });
+    socket.on("leave:channel", (channelId: string) => { if (typeof channelId === "string") socket.leave(`channel:${channelId}`); });
+    socket.on("disconnect", (reason) => log.debug("socket disconnected", { uid, reason }));
+  });
+  log.info("socket.io attached", { path: "/socket.io/" });
+}
+
+// Internal event object → named realtime events. Content-bearing events (message/task) only fan out to channel:<channelId> rooms (members only),
+// preventing private channel content from leaking to non-members; metadata / server-level events (agent/machine/thread:updated) fan out to server:<serverId>.
+export function emitMapped(serverId: string, event: any): void {
+  if (!io) return;
+  const srv = io;                                                           // capture non-null (io is not narrowed inside the closure)
+  const room = srv.to(`server:${serverId}`);                                // server-level (all members)
+  const chan = (cid: string) => srv.to(`channel:${cid}`);                   // channel-level (channel members only)
+  switch (event?.type) {
+    case "message": chan(event.message.channelId).emit("message:new", event.message); break; // content → channel members only
+    case "task": {
+      if (event.op === "deleted") { chan(event.channelId).emit("task:deleted", { channelId: event.channelId, taskId: event.taskId }); break; }
+      const t = event.task; // = serializeMsg(message), includes channelId
+      if (event.op === "created") chan(t.channelId).emit("task:created", { channelId: t.channelId, tasks: [t] });
+      else chan(t.channelId).emit("task:updated", { channelId: t.channelId, task: t });
+      chan(t.channelId).emit("message:updated", t); // task ops also emit message:updated to sync the source message's task fields (channel members only)
+      break;
+    }
+    // agent:activity merges status + trajectory (carries entries[]). Internally we still keep status/trajectory as two sources; map both to this single event here.
+    case "agent": room.emit("agent:activity", { agentId: event.id, name: event.name, status: event.status, activity: event.activity }); break;
+    case "trajectory": room.emit("agent:activity", { agentId: event.agentId, name: event.name, entries: event.entries }); break;
+    case "message:updated": chan(event.message.channelId).emit("message:updated", event.message); break; // reactions/edits (content) → channel members only
+    case "thread:updated": room.emit("thread:updated", { threadChannelId: event.threadChannelId, parentMessageId: event.parentMessageId, replyCount: event.replyCount, participantIds: event.participantIds }); break;
+    case "agent:created": room.emit("agent:created", event.agent); break;
+    case "agent:deleted": room.emit("agent:deleted", { id: event.id }); break;
+    case "machine": room.emit("machine:status", { machineId: event.machineId, status: event.online ? "online" : "offline", online: event.online, hostname: event.hostname, runtimes: event.runtimes }); break; // machine status payload: machineId + status ("online"/"offline")
+    default: if (event?.type) room.emit(String(event.type), event);
+  }
+}

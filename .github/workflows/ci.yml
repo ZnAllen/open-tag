@@ -1,0 +1,31 @@
+name: CI
+
+# Keep types clean and the web app buildable on every push / PR.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  typecheck-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install root deps
+        run: npm ci
+
+      - name: Install web deps
+        run: npm ci --prefix web
+
+      - name: Typecheck (root + web)
+        run: npm run typecheck
+
+      - name: Build web
+        run: npm run build --prefix web

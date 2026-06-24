@@ -1,0 +1,516 @@
+// Message core: seq assignment, @mention parsing, DB write, SSE broadcast (human), wake delivery (agent), target resolution.
+import { and, eq, desc, gt, inArray, like, sql, or, isNull, isNotNull } from "drizzle-orm";
+import { db, schema } from "../db/index.js";
+import { nextSeq, publish } from "./realtime.js";
+import { nextTaskNumber } from "../redis.js";
+import { broadcastToDaemons, daemonCount } from "./daemonHub.js";
+import { agentHasScope } from "./scopes.js";
+import { newKey, hashToken } from "./auth.js";
+import { createLogger } from "../log.js";
+
+const log = createLogger("server:core");
+const PORT = Number(process.env.PORT ?? 7777);
+const SELF_URL = `http://localhost:${PORT}`;
+// Per-agent raw token cache (server process memory; DB stores hash only). Injected into agent process at spawn; resolveAgent looks up by hash. See slice10.
+const agentRawTokens = new Map<string, string>();
+
+// Member description (bio) length limit (HumanDetailPanel/AgentDetailPanel both maxLength=3000 + "Description must be at most 3000 characters"). Shared by human+agent.
+export const MAX_DESCRIPTION = 3000;
+export const DESC_TOO_LONG = `Description must be at most ${MAX_DESCRIPTION} characters`;
+export const descTooLong = (s: unknown): boolean => typeof s === "string" && s.length > MAX_DESCRIPTION;
+
+/** Create a workspace (server/community): create server + creator as owner + default #all channel + add owner to channel. Shared by dev-login / POST /api/servers / seed. */
+export async function createServer(name: string, slug: string, ownerId: string) {
+  const [srv] = await db.insert(schema.servers).values({ name, slug, ownerId, plan: "free" }).returning();
+  await db.insert(schema.serverMembers).values({ serverId: srv!.id, userId: ownerId, role: "owner" });
+  const [all] = await db.insert(schema.channels).values({ serverId: srv!.id, name: "all", description: "General channel for all members", type: "channel" }).returning();
+  await db.insert(schema.channelMembers).values({ channelId: all!.id, memberType: "user", memberId: ownerId }).onConflictDoNothing();
+  return srv!;
+}
+
+export interface Member { type: "user" | "agent"; id: string; name: string; displayName: string; }
+
+export async function channelMembers(channelId: string): Promise<Member[]> {
+  const rows = await db.select().from(schema.channelMembers).where(eq(schema.channelMembers.channelId, channelId));
+  const out: Member[] = [];
+  for (const r of rows) {
+    if (r.memberType === "user") {
+      const u = (await db.select().from(schema.users).where(eq(schema.users.id, r.memberId)))[0];
+      if (u) out.push({ type: "user", id: u.id, name: u.name, displayName: u.displayName });
+    } else {
+      const a = (await db.select().from(schema.agents).where(eq(schema.agents.id, r.memberId)))[0];
+      if (a) out.push({ type: "agent", id: a.id, name: a.name, displayName: a.displayName });
+    }
+  }
+  return out;
+}
+
+export function parseMentions(content: string, members: Member[]) {
+  const found = new Map<string, Member>();
+  const re = /@([A-Za-z0-9_一-龥-]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content))) {
+    const name = m[1]!;
+    const hit = members.find((x) => x.name.toLowerCase() === name.toLowerCase());
+    if (hit) found.set(hit.id, hit);
+  }
+  return [...found.values()];
+}
+
+// Message serialization shape for message:new socket event (omits internal searchVector/agentSendKey).
+export interface ReactionAgg { emoji: string; count: number; reactorIds: string[]; reactorNames: string[]; }
+export function serializeMsg(msg: typeof schema.messages.$inferSelect, mentions: Member[], atts: (typeof schema.attachments.$inferSelect)[] = [], reactions: ReactionAgg[] = []) {
+  return {
+    id: msg.id, seq: msg.seq, channelId: msg.channelId, threadId: msg.threadId,
+    senderType: msg.senderType, senderId: msg.senderId, senderName: msg.senderName, senderMembershipStatus: "active",
+    messageType: msg.messageType, content: msg.content, actionMetadata: msg.actionMetadata ?? null,
+    taskStatus: msg.taskStatus, taskNumber: msg.taskNumber,
+    taskAssigneeType: msg.taskAssigneeType, taskAssigneeId: msg.taskAssigneeId,
+    taskClaimedAt: msg.taskClaimedAt, taskCompletedAt: msg.taskCompletedAt,
+    attachments: atts.map((a) => ({ id: a.id, filename: a.filename, mimeType: a.mimeType, sizeBytes: a.sizeBytes })),
+    mentions: mentions.map((x) => ({ type: x.type, id: x.id, name: x.name })),
+    reactions,
+    createdAt: msg.createdAt, updatedAt: msg.updatedAt,
+  };
+}
+
+/** Aggregate message reactions into grouped shape: one entry per emoji {emoji,count,reactorIds,reactorNames}. */
+export async function aggregateReactions(messageIds: string[]): Promise<Map<string, ReactionAgg[]>> {
+  const out = new Map<string, ReactionAgg[]>();
+  if (!messageIds.length) return out;
+  const rows = await db.select().from(schema.reactions).where(inArray(schema.reactions.messageId, messageIds));
+  if (!rows.length) return out;
+  const uIds = [...new Set(rows.filter((r) => r.memberType === "user").map((r) => r.memberId))];
+  const aIds = [...new Set(rows.filter((r) => r.memberType === "agent").map((r) => r.memberId))];
+  const users = uIds.length ? await db.select().from(schema.users).where(inArray(schema.users.id, uIds)) : [];
+  const agents = aIds.length ? await db.select().from(schema.agents).where(inArray(schema.agents.id, aIds)) : [];
+  const nameOf = (t: string, id: string) => t === "user"
+    ? (users.find((u) => u.id === id)?.displayName || users.find((u) => u.id === id)?.name || "?")
+    : (agents.find((a) => a.id === id)?.displayName || agents.find((a) => a.id === id)?.name || "?");
+  for (const r of rows) {
+    const list = out.get(r.messageId) ?? [];
+    let e = list.find((x) => x.emoji === r.emoji);
+    if (!e) { e = { emoji: r.emoji, count: 0, reactorIds: [], reactorNames: [] }; list.push(e); }
+    e.count++; e.reactorIds.push(r.memberId); e.reactorNames.push(nameOf(r.memberType, r.memberId));
+    out.set(r.messageId, list);
+  }
+  return out;
+}
+
+async function serializeMessageById(messageId: string) {
+  const msg = (await db.select().from(schema.messages).where(eq(schema.messages.id, messageId)))[0];
+  if (!msg) return null;
+  const mts = await db.select().from(schema.messageMentions).where(eq(schema.messageMentions.messageId, messageId));
+  const mentions: Member[] = mts.map((x) => ({ type: x.mentionType as "user" | "agent", id: x.mentionId, name: x.mentionName, displayName: x.mentionName }));
+  const atts = await db.select().from(schema.attachments).where(eq(schema.attachments.messageId, messageId));
+  const reactions = (await aggregateReactions([messageId])).get(messageId) ?? [];
+  return serializeMsg(msg, mentions, atts, reactions);
+}
+
+/** Add reaction (add-or-noop): unique index deduplication, broadcast message:updated. */
+export async function addReaction(serverId: string, messageId: string, memberType: "user" | "agent", memberId: string, emoji: string) {
+  await db.insert(schema.reactions).values({ messageId, memberType, memberId, emoji }).onConflictDoNothing();
+  const m = await serializeMessageById(messageId);
+  if (m) await publish(serverId, { type: "message:updated", message: m });
+  return m;
+}
+export async function removeReaction(serverId: string, messageId: string, memberType: "user" | "agent", memberId: string, emoji: string) {
+  await db.delete(schema.reactions).where(and(eq(schema.reactions.messageId, messageId), eq(schema.reactions.memberType, memberType), eq(schema.reactions.memberId, memberId), eq(schema.reactions.emoji, emoji)));
+  const m = await serializeMessageById(messageId);
+  if (m) await publish(serverId, { type: "message:updated", message: m });
+  return m;
+}
+
+// ── Saved messages / bookmarks (/channels/saved) ──
+// Private bookmarks: deduplicated per member (unique index), no broadcast. save is idempotent (onConflictDoNothing).
+export async function saveMessage(serverId: string, messageId: string, memberType: "user" | "agent", memberId: string) {
+  await db.insert(schema.savedMessages).values({ serverId, messageId, memberType, memberId }).onConflictDoNothing();
+}
+export async function unsaveMessage(serverId: string, messageId: string, memberType: "user" | "agent", memberId: string) {
+  await db.delete(schema.savedMessages).where(and(
+    eq(schema.savedMessages.serverId, serverId), eq(schema.savedMessages.messageId, messageId),
+    eq(schema.savedMessages.memberType, memberType), eq(schema.savedMessages.memberId, memberId)));
+}
+/** Bulk check which messageIds have been saved by this member (POST /channels/saved/check → {savedIds[]}). */
+export async function checkSaved(serverId: string, memberType: "user" | "agent", memberId: string, messageIds: string[]): Promise<string[]> {
+  if (!messageIds.length) return [];
+  const rows = await db.select({ messageId: schema.savedMessages.messageId }).from(schema.savedMessages).where(and(
+    eq(schema.savedMessages.serverId, serverId), eq(schema.savedMessages.memberType, memberType),
+    eq(schema.savedMessages.memberId, memberId), inArray(schema.savedMessages.messageId, messageIds)));
+  return rows.map((r) => r.messageId);
+}
+/** List saved messages (GET /channels/saved):
+ * envelope {saved[], hasMore}; item is flat, uses messageId, inlines channel + thread parent context; no savedAt/attachments/reactions.
+ * Ordered by savedAt (saved row createdAt) descending, limit+offset pagination (limit+1 probe for hasMore). */
+export async function listSaved(serverId: string, memberType: "user" | "agent", memberId: string, limit: number, offset: number) {
+  const rows = await db.select().from(schema.savedMessages).where(and(
+    eq(schema.savedMessages.serverId, serverId), eq(schema.savedMessages.memberType, memberType),
+    eq(schema.savedMessages.memberId, memberId))).orderBy(desc(schema.savedMessages.createdAt)).limit(limit + 1).offset(offset);
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+  if (!page.length) return { saved: [], hasMore: false };
+  // Batch-load messages + their channels + (when thread) parent messages and parent channels, avoid N+1
+  const msgs = await db.select().from(schema.messages).where(inArray(schema.messages.id, page.map((r) => r.messageId)));
+  const msgById = new Map(msgs.map((m) => [m.id, m]));
+  const chans = await db.select().from(schema.channels).where(inArray(schema.channels.id, [...new Set(msgs.map((m) => m.channelId))]));
+  const chById = new Map(chans.map((c) => [c.id, c]));
+  // thread channel → parent message → parent channel
+  const parentMsgIds = [...new Set(chans.filter((c) => c.type === "thread" && c.parentMessageId).map((c) => c.parentMessageId!))];
+  const parentMsgs = parentMsgIds.length ? await db.select().from(schema.messages).where(inArray(schema.messages.id, parentMsgIds)) : [];
+  const parentMsgById = new Map(parentMsgs.map((m) => [m.id, m]));
+  const parentChans = parentMsgs.length ? await db.select().from(schema.channels).where(inArray(schema.channels.id, [...new Set(parentMsgs.map((m) => m.channelId))])) : [];
+  const parentChById = new Map(parentChans.map((c) => [c.id, c]));
+  const saved = page.map((r) => {
+    const m = msgById.get(r.messageId);
+    if (!m) return null;
+    const ch = chById.get(m.channelId);
+    const isThread = ch?.type === "thread";
+    const pm = isThread && ch?.parentMessageId ? parentMsgById.get(ch.parentMessageId) : undefined;
+    const pch = pm ? parentChById.get(pm.channelId) : undefined;
+    return {
+      messageId: m.id, content: m.content, createdAt: m.createdAt,
+      channelId: m.channelId, channelType: ch?.type ?? "channel", channelName: ch?.name ?? null,
+      parentChannelId: pch?.id ?? null, parentChannelType: pch?.type ?? null, parentChannelName: pch?.name ?? null,
+      parentMessageId: isThread ? (ch?.parentMessageId ?? null) : null,
+      senderId: m.senderId, senderType: m.senderType, senderName: m.senderName,
+    };
+  }).filter(Boolean);
+  return { saved, hasMore };
+}
+
+export async function agentConfig(agentId: string) {
+  const a = (await db.select().from(schema.agents).where(eq(schema.agents.id, agentId)))[0];
+  if (!a) return null;
+  // Per-agent independent token (sk_agent_* prefix, slice10):
+  // cache hit → reuse; first time → mint + store hash + cache raw; agent already running (cache lost after server restart but agent still running) → do not re-mint or send new token (daemon ignores agent:start for running agents, agent continues using old token, server verifies via DB hash) → zero desync.
+  let token = agentRawTokens.get(a.id);
+  if (!token && !(a.status === "active" && a.agentTokenHash)) {
+    token = newKey("sk_agent_");
+    agentRawTokens.set(a.id, token);
+    await db.update(schema.agents).set({ agentTokenHash: hashToken(token) }).where(eq(schema.agents.id, a.id));
+  }
+  return {
+    name: a.name, displayName: a.displayName, description: a.description,
+    model: a.model, runtime: a.runtime, runtimeConfig: a.runtimeConfig, sessionId: a.sessionId ?? undefined,
+    serverUrl: SELF_URL, serverId: a.serverId, agentId: a.id, agentToken: token,
+  };
+}
+
+export async function createMessage(opts: {
+  serverId: string; channelId: string;
+  senderType: "user" | "agent" | "system"; senderId: string | null; senderName: string;
+  content: string; messageType?: string; threadId?: string | null; asTask?: boolean; attachmentIds?: string[];
+  actionMetadata?: unknown; // action-card and other platform action payloads (slice09)
+}) {
+  const seq = await nextSeq(opts.serverId);
+  const taskNumber = opts.asTask ? await nextTaskNumber(opts.serverId) : null;
+  const [msg] = await db.insert(schema.messages).values({
+    seq, serverId: opts.serverId, channelId: opts.channelId,
+    senderType: opts.senderType, senderId: opts.senderId, senderName: opts.senderName,
+    messageType: opts.messageType ?? "chat", content: opts.content,
+    actionMetadata: opts.actionMetadata ?? null,
+    threadId: opts.threadId ?? null, searchText: opts.content,
+    taskStatus: opts.asTask ? "todo" : null, taskNumber,
+  }).returning();
+
+  // auto-follow: reply to thread → sender auto-joins; replying after done clears done and brings thread back to inbox
+  if (opts.senderId && opts.senderType !== "system") {
+    const ch = (await db.select({ type: schema.channels.type }).from(schema.channels).where(eq(schema.channels.id, opts.channelId)))[0];
+    if (ch?.type === "thread") {
+      await db.insert(schema.channelMembers).values({ channelId: opts.channelId, memberType: opts.senderType, memberId: opts.senderId }).onConflictDoNothing();
+      await db.update(schema.channelMembers).set({ threadDoneAt: null }).where(eq(schema.channelMembers.channelId, opts.channelId)); // new reply → reset done for thread followers (thread becomes active again in inbox)
+    }
+  }
+
+  // Attachments: backfill messageId/channelId onto the attachment uploaded earlier, so it appears in the channel Files list
+  let atts: (typeof schema.attachments.$inferSelect)[] = [];
+  if (opts.attachmentIds?.length) {
+    await db.update(schema.attachments).set({ messageId: msg!.id, channelId: opts.channelId }).where(inArray(schema.attachments.id, opts.attachmentIds));
+    atts = await db.select().from(schema.attachments).where(inArray(schema.attachments.id, opts.attachmentIds));
+  }
+
+  const members = await channelMembers(opts.channelId);
+  const mentions = parseMentions(opts.content, members);
+  if (mentions.length) {
+    await db.insert(schema.messageMentions).values(
+      mentions.map((x) => ({ messageId: msg!.id, mentionType: x.type, mentionId: x.id, mentionName: x.name })),
+    );
+  }
+  await db.update(schema.channels).set({ lastMessageAt: new Date() }).where(eq(schema.channels.id, opts.channelId));
+
+  // Task creation immediately creates a thread (all tasks have a thread, parentMessageId=task message; created before done)
+  if (opts.asTask) {
+    const th = await getOrCreateThread(opts.serverId, msg!.id);
+    await db.update(schema.messages).set({ threadId: th.id }).where(eq(schema.messages.id, msg!.id));
+    msg!.threadId = th.id;
+  }
+  // Human-side realtime
+  await publish(opts.serverId, { type: "message", channelId: opts.channelId, message: serializeMsg(msg!, mentions, atts) });
+  if (opts.asTask) {
+    await publish(opts.serverId, { type: "task", op: "created", task: serializeMsg(msg!, mentions, atts) });
+    await sysTaskMsg(opts.serverId, opts.channelId, `${opts.senderName} created task #${taskNumber} "${taskTitle(opts.content)}"`); // audit trail (task system messages)
+  }
+
+  // Agent-side wake: only wake agents @-mentioned (in channel), or agent members in a DM.
+  const ch = (await db.select().from(schema.channels).where(eq(schema.channels.id, opts.channelId)))[0];
+  const isDm = ch?.type === "dm";
+  // Message in thread channel → broadcast thread:updated (parentMessageId + replyCount + participantIds)
+  if (ch?.type === "thread" && ch.parentMessageId) {
+    const replies = await db.select({ id: schema.messages.id }).from(schema.messages).where(eq(schema.messages.channelId, ch.id));
+    const parts = await db.select().from(schema.channelMembers).where(eq(schema.channelMembers.channelId, ch.id));
+    await publish(opts.serverId, { type: "thread:updated", threadChannelId: ch.id, parentMessageId: ch.parentMessageId, replyCount: replies.length, participantIds: parts.map((p) => p.memberId) });
+  }
+  const mentionedAgents = new Set(mentions.filter((m) => m.type === "agent").map((m) => m.id));
+  // inbox notice uses human-readable target (#name / dm:@sender), not uuid. threads use channel name.
+  const targetName = isDm ? `dm:@${opts.senderName}` : `#${ch?.name ?? opts.channelId}`;
+  const msgShort = msg!.id.slice(0, 8);
+  const woken: string[] = [];
+  for (const mem of members) {
+    if (mem.type !== "agent" || mem.id === opts.senderId) continue;
+    const mentioned = mentionedAgents.has(mem.id);
+    // Channel messages delivered to all agent members (not limited to @; wake even without @, model decides whether to reply).
+    // Ambient wake without @ requires inbox:receive scope; @-mentioned or DM always delivers.
+    if (!isDm && !mentioned) {
+      const a0 = (await db.select({ scopes: schema.agents.scopes }).from(schema.agents).where(eq(schema.agents.id, mem.id)))[0];
+      if (!agentHasScope(a0?.scopes, "inbox:receive")) continue;
+    }
+    const cfg = await agentConfig(mem.id);
+    if (cfg) broadcastToDaemons(opts.serverId, { type: "agent:start", agentId: mem.id, config: cfg });
+    broadcastToDaemons(opts.serverId, { type: "agent:deliver", agentId: mem.id, seq, from: opts.senderName, target: opts.channelId, targetName, msgShort, isTask: !!opts.asTask, message: { content: opts.content }, mentioned });
+    woken.push(mem.name + (mentioned ? "(@)" : ""));
+  }
+  log.info("message created", {
+    seq, channel: opts.channelId, from: opts.senderName, kind: opts.senderType,
+    mentions: mentions.map((x) => x.name),
+    wakeAgents: woken,
+  });
+  return msg!;
+}
+
+/** Target resolution: #name / dm:@name / thread #name:shortid or dm:@name:shortid.
+ *  Thread suffix shortid = 8-char short id of the parent message → resolve/create the thread channel for that parent message (thread = standalone channel, unified for human/agent). */
+export async function resolveTarget(serverId: string, target: string, selfAgentId: string): Promise<{ channelId: string; threadId: string | null } | null> {
+  let t = target.trim();
+  let threadShort: string | null = null;
+  const colon = t.lastIndexOf(":");
+  if (colon > 0 && !t.slice(colon + 1).includes("@") && /^[0-9a-f]{6,}$/i.test(t.slice(colon + 1))) {
+    threadShort = t.slice(colon + 1); t = t.slice(0, colon);
+  }
+  // 1) Resolve base channel (DM or named channel)
+  let baseChannelId: string | null = null;
+  if (t.startsWith("dm:@")) {
+    const peer = t.slice(4);
+    const u = (await db.select().from(schema.users).where(eq(schema.users.name, peer)))[0];
+    const a = (await db.select().from(schema.agents).where(and(eq(schema.agents.name, peer), eq(schema.agents.serverId, serverId))))[0];
+    const peerId = u?.id ?? a?.id; const peerType = u ? "user" : a ? "agent" : null;
+    if (!peerId || !peerType) return null;
+    baseChannelId = await getOrCreateDM(serverId, selfAgentId, "agent", peerId, peerType);
+  } else {
+    const ch = (await db.select().from(schema.channels).where(and(eq(schema.channels.serverId, serverId), eq(schema.channels.name, t.replace(/^#/, "")))))[0];
+    baseChannelId = ch?.id ?? null;
+  }
+  if (!baseChannelId) return null;
+  // 2) No thread suffix → base channel; has suffix → find parent message (short id prefix) → thread channel of that parent message
+  if (!threadShort) return { channelId: baseChannelId, threadId: null };
+  const parent = (await db.select().from(schema.messages).where(and(eq(schema.messages.serverId, serverId), eq(schema.messages.channelId, baseChannelId), like(sql`${schema.messages.id}::text`, threadShort.toLowerCase() + "%"))))[0];
+  if (!parent) return null;
+  const th = await getOrCreateThread(serverId, parent.id, { type: "agent", id: selfAgentId });
+  return { channelId: th.id, threadId: null };
+}
+
+export async function getOrCreateDM(serverId: string, aId: string, aType: string, bId: string, bType: string): Promise<string> {
+  // Simplified: DM channel name = dm:<sorted ids>
+  const key = "dm:" + [aId, bId].sort().join(":");
+  const existing = (await db.select().from(schema.channels).where(and(eq(schema.channels.serverId, serverId), eq(schema.channels.name, key))))[0];
+  if (existing) return existing.id;
+  // Atomic create: partitioned unique index (serverId, name WHERE type=dm) ensures only one row under concurrency; losing insert returns empty → re-select to get that row.
+  const [ch] = await db.insert(schema.channels).values({ serverId, name: key, type: "dm" }).onConflictDoNothing().returning();
+  if (!ch) return (await db.select().from(schema.channels).where(and(eq(schema.channels.serverId, serverId), eq(schema.channels.name, key))))[0]!.id;
+  await db.insert(schema.channelMembers).values([
+    { channelId: ch.id, memberType: aType, memberId: aId },
+    { channelId: ch.id, memberType: bType, memberId: bId },
+  ]).onConflictDoNothing();
+  return ch.id;
+}
+
+/** Find/create thread channel (thread = channel with type=thread, carrying parentMessageId). Idempotent. creator added as member = auto follow. */
+export async function getOrCreateThread(serverId: string, parentMessageId: string, creator?: { type: "user" | "agent"; id: string }) {
+  let thread = (await db.select().from(schema.channels).where(and(eq(schema.channels.serverId, serverId), eq(schema.channels.type, "thread"), eq(schema.channels.parentMessageId, parentMessageId))))[0];
+  if (!thread) {
+    // Atomic create: partitioned unique index (serverId, parentMessageId WHERE type=thread) ensures only one row under concurrency; losing insert returns empty → re-select.
+    const [ch] = await db.insert(schema.channels).values({ serverId, type: "thread", parentMessageId, name: `thread-${parentMessageId.slice(0, 8)}` }).onConflictDoNothing().returning();
+    thread = ch ?? (await db.select().from(schema.channels).where(and(eq(schema.channels.serverId, serverId), eq(schema.channels.type, "thread"), eq(schema.channels.parentMessageId, parentMessageId))))[0]!;
+    if (ch) { // only add thread root member on the actual new creation (skip for the losing insert)
+      const parent = (await db.select().from(schema.messages).where(eq(schema.messages.id, parentMessageId)))[0];
+      if (parent?.senderId) await db.insert(schema.channelMembers).values({ channelId: thread.id, memberType: parent.senderType as "user" | "agent", memberId: parent.senderId }).onConflictDoNothing();
+    }
+  }
+  if (creator) await db.insert(schema.channelMembers).values({ channelId: thread.id, memberType: creator.type, memberId: creator.id }).onConflictDoNothing();
+  return thread;
+}
+
+// ── Tasks (message-as-task): convert / claim / unclaim / status, all emit task:updated ──────
+async function taskMentions(messageId: string): Promise<Member[]> {
+  const mts = await db.select().from(schema.messageMentions).where(eq(schema.messageMentions.messageId, messageId));
+  return mts.map((x) => ({ type: x.mentionType as "user" | "agent", id: x.mentionId, name: x.mentionName, displayName: x.mentionName }));
+}
+async function emitTaskUpdated(serverId: string, msg: typeof schema.messages.$inferSelect): Promise<void> {
+  await publish(serverId, { type: "task", op: "updated", task: serializeMsg(msg, await taskMentions(msg.id)) });
+}
+
+/** Mark an existing message as a task (open + assign taskNumber). */
+// ── Task lifecycle system messages (convert/claim/unclaim/status each emit one messageType:system audit entry) ──
+const taskTitle = (s: string) => { const t = ((s || "").split("\n")[0] ?? "").trim(); return t.length > 40 ? t.slice(0, 40) + "…" : t; };
+// Task status system message copy (Title-Case + status emoji prefix). Emojis confirmed for in_progress 🔄 / in_review 👁; todo/done/closed pending confirmation, no guessing.
+const STATUS_LABEL: Record<string, string> = { todo: "Todo", in_progress: "In Progress", in_review: "In Review", done: "Done", closed: "Closed" };
+const STATUS_EMOJI: Record<string, string> = { in_progress: "🔄", in_review: "👁" };
+async function actorName(type: "user" | "agent", id: string): Promise<string> {
+  if (type === "agent") { const a = (await db.select().from(schema.agents).where(eq(schema.agents.id, id)))[0]; return a?.displayName || a?.name || "agent"; }
+  const u = (await db.select().from(schema.users).where(eq(schema.users.id, id)))[0]; return u?.displayName || u?.name || "someone";
+}
+// Lightweight system message: only insert + publish message, no wake/no task creation (otherwise every status change wakes all agents = noise)
+async function sysTaskMsg(serverId: string, channelId: string, content: string) {
+  const seq = await nextSeq(serverId);
+  const [m] = await db.insert(schema.messages).values({ seq, serverId, channelId, senderType: "system", senderId: null, senderName: "system", messageType: "system", content, searchText: content }).returning();
+  await db.update(schema.channels).set({ lastMessageAt: new Date() }).where(eq(schema.channels.id, channelId));
+  await publish(serverId, { type: "message", channelId, message: serializeMsg(m!, [], []) });
+  return m!;
+}
+
+export async function convertMessageToTask(serverId: string, messageId: string, by?: { type: "user" | "agent"; id: string }) {
+  const m = (await db.select().from(schema.messages).where(and(eq(schema.messages.id, messageId), eq(schema.messages.serverId, serverId))))[0];
+  if (!m) return null;
+  if (m.taskStatus) return m; // already a task, idempotent (fast path)
+  // Atomic claim: only change status when not yet a task (whoever's UPDATE matches taskStatus IS NULL wins);
+  // prevents concurrent double-convert → wasted task numbers + gaps + duplicate task:created events. Loser returns current state.
+  const [claimed] = await db.update(schema.messages).set({ taskStatus: "todo", updatedAt: new Date() })
+    .where(and(eq(schema.messages.id, messageId), eq(schema.messages.serverId, serverId), isNull(schema.messages.taskStatus))).returning();
+  if (!claimed) return (await db.select().from(schema.messages).where(eq(schema.messages.id, messageId)))[0] ?? null;
+  // Winner gets task number (no waste, no gaps) + creates thread (tasks always have a thread)
+  const taskNumber = await nextTaskNumber(serverId);
+  const th = await getOrCreateThread(serverId, messageId);
+  const [upd] = await db.update(schema.messages).set({ taskNumber, threadId: th.id }).where(eq(schema.messages.id, messageId)).returning();
+  await publish(serverId, { type: "task", op: "created", task: serializeMsg(upd!, await taskMentions(messageId)) });
+  const an = by ? await actorName(by.type, by.id) : "Someone";
+  await sysTaskMsg(serverId, upd!.channelId, `${an} converted a message to task #${taskNumber} "${taskTitle(upd!.content)}"`);
+  return upd!;
+}
+
+/** Claim a task → in_progress + assignee. */
+/**
+ * Resolve messageId: accepts full uuid or the 8-char short id from message headers (msg=<shortid>).
+ * Agents see short ids and will use them directly for claim/update/reply → previously the endpoint queried the uuid column with a short id and threw 500.
+ * Full uuid → verify existence; short id (6+ hex) → prefix match; neither → null (caller returns 404, never 500).
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export async function resolveMessageId(serverId: string, idOrShort: string | undefined | null): Promise<string | null> {
+  const s = (idOrShort ?? "").trim().toLowerCase();
+  if (!s) return null;
+  if (UUID_RE.test(s)) {
+    const m = (await db.select({ id: schema.messages.id }).from(schema.messages).where(and(eq(schema.messages.id, s), eq(schema.messages.serverId, serverId))))[0];
+    return m?.id ?? null;
+  }
+  if (/^[0-9a-f]{6,}$/.test(s)) {
+    const m = (await db.select({ id: schema.messages.id }).from(schema.messages).where(and(like(sql`${schema.messages.id}::text`, s + "%"), eq(schema.messages.serverId, serverId))).limit(1))[0];
+    return m?.id ?? null;
+  }
+  return null;
+}
+
+export async function claimTask(serverId: string, messageId: string, assigneeType: "user" | "agent", assigneeId: string) {
+  // Atomic claim: conditional UPDATE, succeeds only when the task "has not been claimed by another" (taskAssigneeId is null or already this agent = idempotent).
+  // Postgres UPDATE...WHERE acquires a row lock before re-evaluating the predicate → concurrent claims for the same task: only one wins, others get 0 rows → return null (claim failed).
+  // Before the fix this was an unconditional UPDATE: two agents both "succeeded" concurrently and both believed they owned the task → duplicate work.
+  const [upd] = await db.update(schema.messages)
+    .set({ taskStatus: "in_progress", taskAssigneeType: assigneeType, taskAssigneeId: assigneeId, taskClaimedAt: new Date(), updatedAt: new Date() })
+    .where(and(
+      eq(schema.messages.id, messageId),
+      eq(schema.messages.serverId, serverId),
+      or(isNull(schema.messages.taskAssigneeId), eq(schema.messages.taskAssigneeId, assigneeId)),
+    )).returning();
+  if (!upd) return null; // 0 rows = already claimed by another (or task does not exist) → claim failed, caller should back off
+  await emitTaskUpdated(serverId, upd);
+  await sysTaskMsg(serverId, upd.channelId, `${await actorName(assigneeType, assigneeId)} claimed #${upd.taskNumber} "${taskTitle(upd.content)}"`);
+  return upd;
+}
+
+export async function unclaimTask(serverId: string, messageId: string, by?: { type: "user" | "agent"; id: string }) {
+  const [upd] = await db.update(schema.messages)
+    .set({ taskStatus: "todo", taskAssigneeType: null, taskAssigneeId: null, taskClaimedAt: null, updatedAt: new Date() })
+    .where(and(eq(schema.messages.id, messageId), eq(schema.messages.serverId, serverId))).returning();
+  if (!upd) return null;
+  await emitTaskUpdated(serverId, upd);
+  await sysTaskMsg(serverId, upd.channelId, `${by ? await actorName(by.type, by.id) : "Someone"} released #${upd.taskNumber} "${taskTitle(upd.content)}"`);
+  return upd;
+}
+
+/** Valid task status enum; used by server to reject invalid values with 400. */
+export const TASK_STATUSES = ["todo", "in_progress", "in_review", "done", "closed"] as const;
+
+/** Change status (todo|in_progress|in_review|done|closed); done/closed records completedAt; done auto-creates thread. */
+export async function setTaskStatus(serverId: string, messageId: string, status: string, by?: { type: "user" | "agent"; id: string }) {
+  const finished = status === "done" || status === "closed";
+  // Note: thread is already created at task creation/conversion time (findings §8.1 verified: all tasks have a thread, created before done); no need to create it here
+  const [upd] = await db.update(schema.messages)
+    .set({ taskStatus: status, taskCompletedAt: finished ? new Date() : null, updatedAt: new Date() })
+    .where(and(eq(schema.messages.id, messageId), eq(schema.messages.serverId, serverId))).returning();
+  if (!upd) return null;
+  await emitTaskUpdated(serverId, upd); // task message itself updated (taskStatus) → lands in CHANNEL, updates badge + board in channel (recon verified: message:updated/task:updated both in channel)
+  // "moved" system message for status change → lands in the task's THREAD, not channel (message:new channelId=task.threadId).
+  const actor = by ? await actorName(by.type, by.id) : "Someone";
+  // Ensure task has a thread (tasks always have a thread; create now for legacy data / not yet created) → moved system message lands in thread
+  const th = await getOrCreateThread(serverId, upd.id);
+  const threadCh = th.id;
+  if (!upd.threadId) { await db.update(schema.messages).set({ threadId: threadCh }).where(eq(schema.messages.id, upd.id)); upd.threadId = threadCh; }
+  const label = STATUS_LABEL[status] ?? status;
+  const emoji = STATUS_EMOJI[status] ? STATUS_EMOJI[status] + " " : ""; // confirmed for in_progress/in_review; others pending confirmation, no guessing
+  const sysMsg = await sysTaskMsg(serverId, threadCh, `${emoji}${actor} moved #${upd.taskNumber} "${taskTitle(upd.content)}" to ${label}`);
+  // Wake the assigned agent (only when changed by someone else). Verified: human changes status → assignee agent fires agent:activity working detail="Message received".
+  if (upd.taskAssigneeType === "agent" && upd.taskAssigneeId && by?.id !== upd.taskAssigneeId) {
+    await db.insert(schema.channelMembers).values({ channelId: threadCh, memberType: "agent", memberId: upd.taskAssigneeId }).onConflictDoNothing(); // ensure assignee is a thread member, otherwise message check cannot see this system message
+    const cfg = await agentConfig(upd.taskAssigneeId);
+    if (cfg) {
+      broadcastToDaemons(serverId, { type: "agent:start", agentId: upd.taskAssigneeId, config: cfg });
+      broadcastToDaemons(serverId, { type: "agent:deliver", agentId: upd.taskAssigneeId, seq: sysMsg.seq, from: actor, target: threadCh, targetName: `task #${upd.taskNumber}`, msgShort: sysMsg.id.slice(0, 8), isTask: true, message: { content: `#${upd.taskNumber} → ${label}` }, mentioned: true });
+    }
+  }
+  return upd;
+}
+
+/** Delete task: revert to regular message — clear task fields, source message retained; emit task:deleted. */
+export async function deleteTask(serverId: string, messageId: string) {
+  const [upd] = await db.update(schema.messages)
+    .set({ taskStatus: null, taskNumber: null, taskAssigneeType: null, taskAssigneeId: null, taskClaimedAt: null, taskCompletedAt: null, updatedAt: new Date() })
+    .where(and(eq(schema.messages.id, messageId), eq(schema.messages.serverId, serverId), isNotNull(schema.messages.taskStatus))).returning();
+  if (!upd) return null;
+  await publish(serverId, { type: "task", op: "deleted", channelId: upd.channelId, taskId: upd.id });
+  return upd;
+}
+
+// ── Agent lifecycle: start/stop/reset (broadcast daemon control messages + update status + emit socket events) ──
+async function publishAgentState(serverId: string, agentId: string): Promise<void> {
+  const a = (await db.select().from(schema.agents).where(eq(schema.agents.id, agentId)))[0];
+  if (a) await publish(serverId, { type: "agent", id: a.id, name: a.name, status: a.status, activity: a.activity });
+}
+/** Start an agent (requires local daemon to be online). */
+export async function startAgent(serverId: string, agentId: string): Promise<{ ok: boolean; reason?: string }> {
+  const cfg = await agentConfig(agentId);
+  if (!cfg) return { ok: false, reason: "agent not found" };
+  if (daemonCount(serverId) === 0) return { ok: false, reason: "no daemon online" };
+  broadcastToDaemons(serverId, { type: "agent:start", agentId, config: cfg });
+  await db.update(schema.agents).set({ status: "active", activity: "working" }).where(eq(schema.agents.id, agentId));
+  await publishAgentState(serverId, agentId);
+  return { ok: true };
+}
+export async function stopAgent(serverId: string, agentId: string): Promise<boolean> {
+  broadcastToDaemons(serverId, { type: "agent:stop", agentId });
+  await db.update(schema.agents).set({ status: "inactive", activity: "offline" }).where(and(eq(schema.agents.id, agentId), eq(schema.agents.serverId, serverId)));
+  await publishAgentState(serverId, agentId);
+  return true;
+}
+export async function resetAgent(serverId: string, agentId: string, wipeWorkspace = false, clearMemory = false): Promise<boolean> {
+  broadcastToDaemons(serverId, { type: "agent:reset", agentId, wipeWorkspace, clearMemory });
+  await db.update(schema.agents).set({ status: "inactive", activity: "offline", sessionId: null }).where(and(eq(schema.agents.id, agentId), eq(schema.agents.serverId, serverId)));
+  await publishAgentState(serverId, agentId);
+  return true;
+}
