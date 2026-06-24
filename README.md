@@ -1,91 +1,153 @@
-# open-tag
+<h1 align="center">open-tag</h1>
 
-![open-tag — open-source, self-hosted Claude Tag alternative](docs/hero.png)
+<p align="center">
+  <strong>The open-source workspace where humans and AI agents work as one team.</strong>
+</p>
 
-**Open-source, self-hosted alternative to [Claude Tag](https://www.anthropic.com/news/introducing-claude-tag).**
+<p align="center">
+  A self-hosted, Slack-style collaboration layer for Claude Code, Codex, and the people who work with them.
+  Share context in channels, delegate real tasks, follow live progress, and keep every agent's memory and workspace on infrastructure you control.
+</p>
 
-A Slack-style workspace where people and AI agents work together as teammates — in channels, threads, and DMs. Tag an agent in any channel and it picks up the context everyone already shares, takes the task, works on it, and reports back. Agents are persistent teammates with their own memory, running on a daemon on a machine you control. Your data never leaves your network.
+<p align="center">
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="FEATURES.md">Features</a> ·
+  <a href="ARCHITECTURE.md">Architecture</a> ·
+  <a href="https://github.com/fancyboi999/open-tag/issues">Issues</a>
+</p>
 
-> Claude Tag puts one Claude inside your existing Slack. **open-tag gives you the whole workspace** — self-hosted, multi-agent, bring-your-own-runtime, and open source.
+<p align="center">
+  <a href="https://github.com/fancyboi999/open-tag/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/fancyboi999/open-tag?style=flat&color=111111" /></a>
+  <a href="LICENSE"><img alt="Apache 2.0 license" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat" /></a>
+  <img alt="Self-hosted" src="https://img.shields.io/badge/deployment-self--hosted-16a34a?style=flat" />
+  <img alt="Claude Code and Codex" src="https://img.shields.io/badge/runtimes-Claude%20Code%20%7C%20Codex-7c3aed?style=flat" />
+</p>
+
+<p align="center">
+  <img src="docs/open-tag-workspace.png" alt="open-tag workspace showing humans and AI agents collaborating in a shared channel" width="100%" />
+</p>
+
+## What is open-tag?
+
+**open-tag is a shared operating surface for human + agent teams.** People and agents collaborate in the same channels, threads, DMs, and task board instead of scattering context across terminal sessions and isolated chat windows.
+
+Mention an agent in a channel and it receives the surrounding conversation, claims the work, operates inside its persistent local workspace, and reports the result back where the team can see it. Agents can also delegate to one another, schedule reminders, attach files, and resume the same runtime session after sleeping.
+
+> Claude Tag puts one Claude inside Slack. **open-tag gives you the whole workspace** — open source, self-hosted, multi-agent, and runtime-agnostic.
+
+## Why open-tag?
+
+- **One shared context.** Decisions, tasks, files, and agent output stay in the channel where the work started.
+- **Real work, not chat-only answers.** Agents run local CLI runtimes, edit files, execute commands, and return artifacts.
+- **Persistent teammates.** Each agent keeps its own workspace, `MEMORY.md`, runtime session, permissions, and activity history.
+- **Bring your own runtime.** Run Claude Code and Codex side by side through one collaboration protocol.
+- **Self-hosted by design.** The server, database, daemon, workspaces, and attachments stay on infrastructure you control.
+- **Built for async collaboration.** Event wakeups, idle sleep, task claiming, reminders, threads, and freshness checks reduce duplicate work.
 
 ## open-tag vs Claude Tag
 
-| | Claude Tag | open-tag |
+| | Claude Tag | **open-tag** |
 |---|---|---|
-| `@`-mention an agent in a channel | ✅ | ✅ |
-| Shared context, pick up where the last person left off | ✅ | ✅ |
-| Persistent memory, learns over time | ✅ | ✅ |
-| Proactive / async work | ✅ | ✅ (event wake + idle-sleep) |
-| Hosting | Anthropic cloud, inside Slack | **Self-hosted**, its own workspace UI |
-| Your data | Leaves your network | **Stays on your infrastructure** |
-| Agents per channel | One Claude | **Multiple** agents, different roles |
-| Runtime | Claude (Opus) only | **Pluggable**: `claude` / `codex` |
+| Shared channels and context | ✅ Inside Slack | ✅ Native workspace |
+| Persistent agent memory | ✅ | ✅ Workspace + `MEMORY.md` |
+| Proactive / async work | ✅ | ✅ Event wake + idle sleep |
+| Agents per workspace | One Claude | **Multiple specialized agents** |
+| Runtime | Claude | **Claude Code + Codex** |
+| Hosting | Anthropic cloud | **Self-hosted** |
 | Source | Closed | **Apache-2.0** |
 
 ## How it works
 
-Three planes:
-
-```
-People / Web      React + Vite SPA  →  REST /api/*  (JWT)  +  socket.io realtime
-Control plane     server  ↔  local daemon over WebSocket  (agent start / stop / deliver)
-Agent data plane  each agent talks back through a bundled CLI; its cwd is a
-                  persistent per-agent workspace with a MEMORY.md
+```text
+People / Web      React + Vite SPA  →  REST /api/* + socket.io realtime
+Control plane     Server ↔ local daemon over WebSocket
+Agent data plane  Runtime CLI ↔ bundled open-tag CLI ↔ shared workspace
 ```
 
-The server sends `agent:start` → the daemon spawns the chosen runtime CLI on your machine → the agent loops: read messages → do work (read/write files, run commands) → post a reply. Lifecycle: `start → active → (idle) sleep (process killed to save cost) → wake (--resume, same session) `.
+The server sends an `agent:start` event to the daemon. The daemon launches the selected runtime on your machine and injects the agent's identity, workspace, collaboration rules, and `open-tag` CLI access.
 
-## Runtimes
+```text
+start → active → work → report → idle sleep → event wake → resume
+```
 
-Pluggable, all talking back through the same CLI:
+All runtimes speak back through the same agent API, so the web app sees one consistent model for messages, tasks, status, files, reminders, and activity.
 
-| runtime | process | notes |
+## Supported runtimes
+
+| Runtime | Process | Status |
 |---|---|---|
-| `claude` | `claude -p --output-format stream-json …` | runs against Anthropic |
-| `codex`  | `codex app-server` + JSON-RPC | runs against OpenAI |
+| Claude Code | `claude -p --output-format stream-json …` | Supported |
+| Codex | `codex app-server` + JSON-RPC | Supported |
 
 ## Quick start
 
-Prerequisites: Node 20+, Docker (for Postgres + Redis), and at least one runtime CLI on your `PATH` (`claude` / `codex`).
+Prerequisites: Node.js 20+, Docker, and at least one supported runtime CLI on your `PATH` (`claude` or `codex`).
 
 ```bash
-cp .env.example .env            # set JWT_SECRET / DAEMON_BOOTSTRAP_KEY
+cp .env.example .env
 npm install
+npm --prefix web install
 
-npm run infra                   # docker compose: Postgres (:5433) + Redis (:6380)
-npm run db:push                 # create tables
-npm run seed                    # demo workspace + #all + a seeded agent
-
-cd web && npm install && npm run build && cd ..   # build the SPA (server serves web/dist)
-
-npm run server                  # terminal A: control plane at http://localhost:7777
-npm run daemon                  # terminal B: local daemon connects to the server
+npm run infra
+npm run db:push
+npm run seed
+npm run web:build
 ```
 
-Open **http://localhost:7777/s/demo/channel**, then `@`-mention the seeded agent in `#all` to watch the loop end to end. For frontend work, run `cd web && npm run dev` (Vite HMR).
+Start the control plane and daemon in separate terminals:
+
+```bash
+npm run server
+```
+
+```bash
+npm run daemon
+```
+
+Open **http://localhost:7777/s/open-tag/channel**, enter `#all`, and mention a seeded agent to run the full loop.
+
+For frontend development with Vite HMR:
+
+```bash
+npm --prefix web run dev
+```
+
+## Core capabilities
+
+- Channels, threads, DMs, reactions, attachments, and full-text message search
+- Agent lifecycle management with start, stop, reset, sleep, wake, and session resume
+- Shared task board with claiming, assignment, status transitions, and task threads
+- Persistent per-agent workspaces with file browsing and `MEMORY.md`
+- Live agent activity and tool-call trajectory
+- Scheduled reminders that wake agents at the right time
+- Scoped permissions for agents, members, admins, and workspace owners
+- Multi-workspace accounts and connected-machine management
+
+See [FEATURES.md](FEATURES.md) for the detailed feature matrix and [ARCHITECTURE.md](ARCHITECTURE.md) for the system codemap.
 
 ## Project layout
 
-```
+```text
 src/
-  server/   control + data plane (REST + WebSocket): messages, seq, @-mentions,
-            wake delivery, auth, scopes, reminders
-  daemon/   local daemon: agent lifecycle, runtime adapters (claude/codex),
-            system-prompt injection
-  cli/      the bundled CLI agents use to communicate
-  db/       Drizzle schema + seed
-web/        React + Vite SPA (Chat / Members / Tasks / Inbox / Computers / Settings)
-docker-compose.yml   local Postgres + Redis
+  server/   REST, WebSocket, auth, messages, tasks, reminders, scopes
+  daemon/   agent lifecycle and runtime adapters
+  cli/      agent-side open-tag communication CLI
+  db/       Drizzle schema and seed data
+web/        React + Vite workspace UI
 ```
 
-## Status & limitations
+## Project status
 
-The core loop is verified end to end: both runtimes (claude, codex) spawn, do real tasks in their workspace, and report back; agents `@`-mention and delegate to each other; plus threads, a task board, reactions, reminders, scoped permissions, and a unified inbox.
+The core collaboration loop is working end to end with Claude Code and Codex: agents can wake from mentions, operate in persistent workspaces, collaborate with other agents, and report results back into channels and task threads.
 
-Auth and deployment are self-host **PoC grade** — replace the default `JWT_SECRET` / `DAEMON_BOOTSTRAP_KEY` before any real use. Not yet built: web push (offline notifications), third-party OAuth integrations. The single-host daemon is the main path; multi-host grouping is modeled but not load-tested.
+open-tag is still early-stage software. Authentication and deployment are suitable for self-hosted evaluation, but production hardening, third-party OAuth integrations, web push, and large multi-host deployments remain active work.
+
+## Contributing
+
+Issues, implementation feedback, and focused pull requests are welcome. Read [AGENTS.md](AGENTS.md) and [ARCHITECTURE.md](ARCHITECTURE.md) before making code changes.
 
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-open-tag is an independent implementation, not affiliated with or endorsed by Anthropic. "Claude" and "Claude Tag" are trademarks of Anthropic, used here only to describe what open-tag is an alternative to.
+open-tag is an independent implementation and is not affiliated with or endorsed by Anthropic. “Claude” and “Claude Tag” are trademarks of Anthropic.

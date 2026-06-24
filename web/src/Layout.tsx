@@ -23,7 +23,7 @@ export function Layout() {
   const { unread } = useStore();
   const { t } = useTranslation();
   const [showQS, setShowQS] = useState(false);
-  const slug = server || "demo";
+  const slug = server || "open-tag";
   const isChat = loc.pathname.includes("/channel");
   const go = (key: string) => nav(`/s/${slug}/${key}`);
   const active = (key: string) => loc.pathname.includes("/" + key);

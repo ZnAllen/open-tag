@@ -1,4 +1,4 @@
-// Initial seed data: one human (you) + one workspace (demo) + #all channel + one agent (ada)
+// Initial seed data: one human (you) + the open-tag workspace + #all channel + one agent (ada)
 import "../env.js"; // must be first: loads .env / ENV_FILE (.env.prod) → DATABASE_URL, before the db connection (required when running seed standalone)
 import { db, schema, sql } from "./index.js";
 import { eq } from "drizzle-orm";
@@ -6,16 +6,23 @@ import { eq } from "drizzle-orm";
 async function main() {
   const { users, servers, serverMembers, agents, channels, channelMembers } = schema;
 
-  // Idempotent: skip if the demo workspace already exists
-  const existing = await db.select().from(servers).where(eq(servers.slug, "demo"));
-  if (existing.length) { console.log("[seed] demo workspace already exists, skipping"); await sql.end(); return; }
+  // Idempotent, with a one-time migration for installs created before the default slug was renamed.
+  const existing = await db.select().from(servers).where(eq(servers.slug, "open-tag"));
+  if (existing.length) { console.log("[seed] open-tag workspace already exists, skipping"); await sql.end(); return; }
+  const legacy = await db.select().from(servers).where(eq(servers.slug, "demo"));
+  if (legacy.length) {
+    await db.update(servers).set({ slug: "open-tag", name: "open-tag" }).where(eq(servers.id, legacy[0]!.id));
+    console.log("[seed] migrated workspace slug demo -> open-tag");
+    await sql.end();
+    return;
+  }
 
   const [you] = await db.insert(users).values({
     name: "you", displayName: "You", email: "you@open-tag.local",
   }).returning();
 
   const [server] = await db.insert(servers).values({
-    name: "open-tag demo", slug: "demo", ownerId: you!.id, plan: "free",
+    name: "open-tag", slug: "open-tag", ownerId: you!.id, plan: "free",
   }).returning();
 
   await db.insert(serverMembers).values({ serverId: server!.id, userId: you!.id, role: "owner" });
@@ -36,7 +43,7 @@ async function main() {
   ]);
 
   console.log("[seed] done:");
-  console.log("  server:", server!.id, "(slug=demo)");
+  console.log("  server:", server!.id, "(slug=open-tag)");
   console.log("  user  :", you!.id, "(you)");
   console.log("  agent :", ada!.id, "(ada)");
   console.log("  channel #all:", all!.id);

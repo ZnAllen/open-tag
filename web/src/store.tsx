@@ -48,7 +48,7 @@ export const useStore = () => useContext(Ctx);
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const [serverId, setServerId] = useState("");
-  const [slug, setSlug] = useState("demo");
+  const [slug, setSlug] = useState("open-tag");
   const [servers, setServers] = useState<ServerInfo[]>([]);          // all servers the user belongs to (used by server switcher)
   const [capabilities, setCapabilities] = useState<Record<string, boolean>>({}); // capability flags for the current server (used to show/hide UI)
   const [serverAvatar, setServerAvatar] = useState<string | null>(null); // workspace avatar URL (token-signed for sidebar display); null = use first letter
@@ -160,7 +160,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const urlSlug = location.pathname.match(/\/s\/([^/]+)/)?.[1]; // resolve workspace from URL /s/:slug (multi-workspace support); fall back to first
       const cur = serverList.find((s) => s.slug === urlSlug) || serverList[0];
       if (!cur) { setReady(true); return; } // no workspace found: prevent white screen (defensive fallback; workspace is normally created on register/dev-login)
-      sidRef.current = cur.id; setServerId(cur.id); setSlug(cur.slug || "demo"); setMyRole(cur.role || "member"); setCapabilities(cur.capabilities || {});
+      sidRef.current = cur.id; setServerId(cur.id); setSlug(cur.slug || "open-tag"); setMyRole(cur.role || "member"); setCapabilities(cur.capabilities || {});
       setServerAvatar(cur.avatarUrl ? `${cur.avatarUrl}?token=${encodeURIComponent(tokenRef.current)}` : null);
       await reload();
       // Pre-load saved message id set (small enough for a single full fetch; drives bookmark state + Saved count).

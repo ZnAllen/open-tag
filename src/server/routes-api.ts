@@ -41,7 +41,7 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
     const { name = "you" } = await readJson(req);
     let u = (await db.select().from(schema.users).where(eq(schema.users.name, name)))[0];
     if (!u) [u] = await db.insert(schema.users).values({ name, displayName: name, email: `${name}@dev.local` }).returning();
-    // Multi-tenant: each user has isolated data — ensure the user has their own server (creates an empty one if absent, zero channels/agents; "you" owns the seeded demo)
+    // Multi-tenant: each user has isolated data — ensure the user has their own server (creates an empty one if absent, zero channels/agents; "you" owns the seeded default workspace)
     const mine = (await db.select().from(schema.servers).where(eq(schema.servers.ownerId, u!.id)))[0];
     if (!mine) await createServer(`${name}'s workspace`, `u-${u!.id.slice(0, 8)}`, u!.id);
     if (!u) return (sendErr(res, 500, "dev-login failed"), true);
