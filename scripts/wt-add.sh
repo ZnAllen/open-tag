@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Create an isolated dev worktree: own branch + ports + database + redis DB + .env, with deps installed and DB seeded.
+# Lets you develop several features in parallel without port/database collisions.
+# Usage: npm run wt:add -- <name>     (e.g. npm run wt:add -- msg-edit)
+set -euo pipefail
+NAME="${1:-}"
+[ -z "$NAME" ] && { echo "Usage: npm run wt:add -- <name>  (e.g. msg-edit)"; exit 1; }
+SAFE="${NAME//[^a-zA-Z0-9]/_}"
+WT="../open-tag-$NAME"
+[ -e "$WT" ] && { echo "✗ $WT already exists"; exit 1; }
+
+# Scan for free ports (server from 7801, vite from 5301; avoids dev 7777/5273 and prod 7788).
+free_port() { local p=$1; while lsof -i ":$p" >/dev/null 2>&1; do p=$((p+1)); done; echo "$p"; }
+SPORT=$(free_port 7801)
+VPORT=$(free_port 5301)
+RDB=$(( (SPORT - 7799) % 14 + 2 ))      # redis DB index 2..15 (avoids dev/0, prod/1)
+DB="opentag_$SAFE"
+
+echo "→ worktree=$WT  server=$SPORT  vite=$VPORT  db=$DB  redis=/$RDB"
+git worktree add "$WT" -b "feature/$NAME"
+docker compose exec -T postgres createdb -U opentag "$DB" 2>/dev/null || echo "  (db $DB already exists, reusing)"
+
+cat > "$WT/.env" <<EOF
+PORT=$SPORT
+VITE_PORT=$VPORT
+DATABASE_URL=postgres://opentag:opentag@localhost:5433/$DB
+REDIS_URL=redis://localhost:6380/$RDB
+JWT_SECRET=dev-secret-change-me
+DAEMON_BOOTSTRAP_KEY=poc-secret-key
+EOF
+
+echo "→ Installing deps + pushing schema + seeding (please wait)…"
+( cd "$WT" && npm install --silent && ( cd web && npm install --silent ) && npm run db:push && npm run seed )
+
+cat <<EOF
+
+✅ worktree '$NAME' ready (branch feature/$NAME)
+   cd $WT
+   npm run server            # backend on $SPORT (reads this .env)
+   npm run daemon            # daemon auto-connects to $SPORT
+   (cd web && npm run dev)   # frontend on $VPORT, proxies → $SPORT
+   open http://localhost:$VPORT
+⚠️ To remove, run from the main repo: npm run wt:rm -- $NAME
+EOF
