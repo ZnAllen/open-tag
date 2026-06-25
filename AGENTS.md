@@ -43,6 +43,11 @@ its own iterative improvement — autonomously.
   checkout; use judgment, don't spin up a worktree's whole DB+seed for a typo. A soft,
   non-blocking reminder fires once per session when you edit on `main` in the main checkout
   (`.claude/hooks/worktree-reminder.sh`, wired in `.claude/settings.json`).
+- A `SessionStart` hook (`.claude/hooks/pull-main-on-session-start.sh`) keeps the main
+  checkout's `main` fresh by **fast-forwarding** it to `origin/main` once per session —
+  but only when it's a zero-risk FF: it skips inside a worktree, off `main`, on a dirty
+  tree, or when local `main` has diverged. It never merges, rewrites, or touches a feature
+  branch. (Deliberately *not* a pull-on-every-edit hook — that would clobber in-progress work.)
 - Use `npm run wt:add -- <name>` to spin up an isolated git worktree (its own ports +
   `opentag_<name>` database + redis index + **`OPEN_TAG_HOME=~/.open-tag-<name>` data dir** +
   seeded data); `npm run wt:rm -- <name>` tears it down (and cleans the data dir + db). Lets
