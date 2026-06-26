@@ -45,7 +45,8 @@ function Reactions({ m, mine, onReact }: { m: Msg; mine: string; onReact: (emoji
     <div className="msg-rx">
       {rs.map((r) => {
         const did = !!mine && r.reactorIds?.includes(mine);
-        return <button key={r.emoji} className={"rx-chip" + (did ? " on" : "")} title={(r.reactorNames || []).join(", ")} onClick={() => onReact(r.emoji, !!did)}>{r.emoji} {r.count}</button>;
+        const names = (r.reactorNames || []).filter(Boolean).join(", "); // who reacted — shown in a custom hover tooltip (native title is slow/unstyled/missing on touch)
+        return <button key={r.emoji} className={"rx-chip" + (did ? " on" : "")} onClick={() => onReact(r.emoji, !!did)}>{r.emoji} {r.count}{names ? <span className="rx-tip" role="tooltip">{names}</span> : null}</button>;
       })}
       <span className="rx-add-wrap">
         <button className="rx-add" title={i18n.t("chat.addReaction")} onMouseDown={(e) => { e.preventDefault(); setPick((v) => !v); }}><Smile size={15} /></button>
