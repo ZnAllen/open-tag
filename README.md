@@ -1,6 +1,10 @@
 <h1 align="center">open-tag</h1>
 
 <p align="center">
+  English · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <strong>The open-source workspace where humans and AI agents work as one team.</strong>
 </p>
 
