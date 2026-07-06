@@ -134,7 +134,7 @@ export class AgentManager {
     });
     const env: NodeJS.ProcessEnv = {
       ...process.env, FORCE_COLOR: "0",
-      PATH: `${this.binDir}:${process.env.PATH ?? ""}`,
+      PATH: `${this.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
       OPEN_TAG_SERVER_URL: config.serverUrl, OPEN_TAG_AGENT_ID: agentId, OPEN_TAG_AGENT_TOKEN: config.agentToken ?? "",
     };
     delete env.CLAUDECODE; delete env.CLAUDE_CODE_ENTRYPOINT;

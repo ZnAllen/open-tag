@@ -75,3 +75,4 @@ conn.connect();
 const shutdown = () => { log.info("shutting down"); mgr.stopAll(); conn.close(); process.exit(0); };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+process.on("SIGBREAK", shutdown); // Windows Ctrl+Break (SIGTERM is not available on Windows)
