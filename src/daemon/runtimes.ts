@@ -15,7 +15,7 @@ export type { Runtime, RuntimeSession, RuntimeCallbacks, StartOpts, TrajectoryEn
 function has(tool: string): boolean {
   try {
     if (process.platform === "win32") {
-      execSync(`powershell -NoProfile -Command "Get-Command ${tool} -ErrorAction Stop"`, { stdio: "pipe" });
+      execSync(`where ${tool} 2>nul`, { stdio: "pipe" });
     } else {
       execSync(`command -v ${tool}`, { stdio: "pipe" });
     }
