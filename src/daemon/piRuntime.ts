@@ -9,6 +9,7 @@
 // contract as the other runtimes. stdin is closed (the prompt is an argv value).
 import { type ChildProcess } from "node:child_process";
 import { spawnSafe } from "./spawnSafe.js";
+import { killTree } from "./killTree.js";
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Runtime, StartOpts, RuntimeCallbacks, RuntimeSession, TrajectoryEntry } from "./runtime.js";
@@ -147,7 +148,7 @@ class PiRun {
   stop(): void {
     this.stopped = true;
     const p = this.proc; this.proc = null;
-    if (p) { try { p.kill("SIGTERM"); } catch { /* */ } }
+    if (p) { killTree(p); }
   }
 }
 

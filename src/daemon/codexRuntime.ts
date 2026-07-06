@@ -3,6 +3,7 @@
 // Automatically approves exec/patch/elicitation requests in daemon mode.
 import { type ChildProcess } from "node:child_process";
 import { spawnSafe } from "./spawnSafe.js";
+import { killTree } from "./killTree.js";
 import type { Runtime, StartOpts, RuntimeCallbacks, RuntimeSession } from "./runtime.js";
 
 const MAX = 2000;
@@ -194,6 +195,6 @@ export const codexRuntime: Runtime = {
     });
     proc.on("exit", (code) => { client.closeAllPending(new Error("codex exited")); reportExit(code); });
 
-    return { deliver: (text) => { queue.push(text); pump(); }, stop: () => { try { proc.kill("SIGTERM"); } catch { /* */ } } };
+    return { deliver: (text) => { queue.push(text); pump(); }, stop: () => { killTree(proc); } };
   },
 };

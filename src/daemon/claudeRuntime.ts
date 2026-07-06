@@ -3,6 +3,7 @@
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSafe } from "./spawnSafe.js";
+import { killTree } from "./killTree.js";
 import type { Runtime, StartOpts, RuntimeCallbacks, RuntimeSession, TrajectoryEntry } from "./runtime.js";
 
 const MAX = 2000;
@@ -95,6 +96,6 @@ export const claudeRuntime: Runtime = {
       }
     }
 
-    return { deliver: (text) => writeUser(text), stop: () => { try { proc.kill("SIGTERM"); } catch { /* */ } } };
+    return { deliver: (text) => writeUser(text), stop: () => { killTree(proc); } };
   },
 };

@@ -9,6 +9,7 @@ import { readFile, unlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSafe } from "./spawnSafe.js";
+import { killTree } from "./killTree.js";
 import type { Runtime, StartOpts, RuntimeCallbacks, RuntimeSession } from "./runtime.js";
 
 const MAX = 4000;
@@ -296,7 +297,7 @@ class HermesRun {
     const p = this.proc;
     this.proc = null;
     if (p) {
-      try { p.kill("SIGTERM"); } catch { /* */ }
+      killTree(p);
     }
   }
 }

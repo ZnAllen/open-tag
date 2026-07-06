@@ -12,6 +12,7 @@ import { type ChildProcess } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSafe } from "./spawnSafe.js";
+import { killTree } from "./killTree.js";
 import type { Runtime, StartOpts, RuntimeCallbacks, RuntimeSession, TrajectoryEntry } from "./runtime.js";
 
 const MAX = 2000;
@@ -152,7 +153,7 @@ class CursorRun {
   stop(): void {
     this.stopped = true;
     const p = this.proc; this.proc = null;
-    if (p) { try { p.kill("SIGTERM"); } catch { /* */ } }
+    if (p) { killTree(p); }
   }
 }
 
