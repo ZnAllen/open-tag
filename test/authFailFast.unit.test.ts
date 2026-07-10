@@ -8,13 +8,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// tsx's real JS entrypoint: `npx`/`.bin/tsx` are shell shims spawnSync can't exec
+// on Windows, but `node tsx/dist/cli.mjs` works on every platform.
+const TSX_CLI = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
 
 /** Run a small snippet in a fresh tsx subprocess with a given environment.
  *  Returns { status, stderr }. */
 function runSnippet(snippet: string, extraEnv: NodeJS.ProcessEnv): { status: number | null; stderr: string } {
   const r = spawnSync(
-    "npx",
-    ["tsx", "--input-type=module", "--eval", snippet],
+    process.execPath,
+    [TSX_CLI, "--input-type=module", "--eval", snippet],
     {
       cwd: ROOT,
       env: { ...process.env, ...extraEnv },
