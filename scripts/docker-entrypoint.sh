@@ -1,6 +1,7 @@
 #!/bin/sh
 # Control-plane container entrypoint: bring the schema and bootstrap data up to date (both idempotent),
 # then hand off to the server. Postgres/Redis readiness is guaranteed by compose `depends_on: service_healthy`.
+
 #
 # Schema migration safety:
 #   drizzle-kit push WITHOUT --force is additive-safe: it applies additive-only changes without

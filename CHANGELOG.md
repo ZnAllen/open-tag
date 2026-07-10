@@ -9,6 +9,24 @@ from `main`; see commit history for fine-grained server/web changes.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-07-06
+
+### Added
+
+- **Windows support**: daemon now runs natively on Windows (Docker Desktop + local daemon)
+- `spawnSafe.ts` uses `cross-spawn` for correct Windows `.cmd` file resolution and argument escaping
+- `killTree.ts`: process tree termination utility (`taskkill /T /F` on Windows, process group kill on POSIX)
+- `docs/self-host-windows.md`: full Windows deployment guide
+
+### Fixed
+
+- Runtime detection (`command -v` → `powershell Get-Command` on Windows)
+- CLI spawn: all 8 runtime adapters use `cross-spawn` instead of raw `spawn()`, avoiding Node v24 `.cmd` symlink bug
+- Agent PATH separator: uses `path.delimiter` (`;` on Windows) instead of hardcoded `:`
+- `.cmd` wrapper: `ensureOpenTagBin()` generates `open-tag.cmd` on Windows
+- Signal handling: `SIGBREAK` (Ctrl+Break) registered for Windows graceful shutdown; `listModels` timeout uses signal-less `kill()` on Windows
+- CRLF hazard in `scripts/docker-entrypoint.sh`
+
 ## [0.8.3] — 2026-07-06
 
 ### Fixed
